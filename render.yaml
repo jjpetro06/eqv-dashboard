@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: eqv-dashboard
+    runtime: python
+    buildCommand: pip install openpyxl pandas && python build_dashboard.py
+    startCommand: python -m http.server 10000
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.6"
