@@ -1,16 +1,40 @@
 #!/usr/bin/env python3
 """
-Build the EQV Production Dashboard HTML from 3 Excel files:
+Build the EQV Production Dashboard HTML from Excel files:
 - EQV Historical Prod.xlsx (Actuals): production by month by propnum
 - EQV Well Monthly CF Export.xlsx (Forecast): forecast by month by lease
-- EQV Well Info.xlsx: maps lease to propnum, provides hierarchy info
+- EQV Well Info.xlsx: maps lease to propnum, provides well metadata
+- well_routes_export_1.xlsx: maps wells to routes (with API)
+- pumper-tech list.xlsx: maps routes to foreman/tech/pumper hierarchy
 """
 
 import pandas as pd
 import json
 import gzip
 import base64
-import sys
+import re
+
+
+def normalize_well_name(s):
+    """Normalize well name for matching."""
+    s = str(s).upper().strip()
+    s = s.replace('"', '').replace("'", '').replace(',', '').replace('#', '')
+    s = re.sub(r'\s*\(.*?\)', '', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+
+def normalize_aggressive(s):
+    """More aggressive normalization: remove dashes, SL, leading zeros."""
+    s = normalize_well_name(s)
+    s = s.replace('-', '').replace(' SL ', ' ')
+    tokens = s.split()
+    out = []
+    for t in tokens:
+        if re.match(r'^0+\d+', t):
+            t = t.lstrip('0') or '0'
+        out.append(t)
+    return ' '.join(out)
 
 
 def build_data():
@@ -18,6 +42,8 @@ def build_data():
     wi = pd.read_excel("EQV Well Info.xlsx")
     actuals = pd.read_excel("EQV Historical Prod.xlsx")
     forecast = pd.read_excel("EQV Well Monthly CF Export.xlsx")
+    route_export = pd.read_excel("well_routes_export_1.xlsx")
+    tech_list = pd.read_excel("pumper-tech list.xlsx")
 
     # --- Well Info: build lookup tables ---
     lease_to_propnum = dict(zip(wi["LEASE"], wi["PROPNUM"]))
@@ -34,6 +60,39 @@ def build_data():
             "op_non": str(row["OP_NON"]) if pd.notna(row["OP_NON"]) else "Unknown",
             "major": str(row["MAJOR"]) if pd.notna(row["MAJOR"]) else "Unknown",
         }
+
+    # --- Build LEASE name lookup (normalized) ---
+    lease_norm1 = {}
+    lease_norm2 = {}
+    for _, row in wi.iterrows():
+        n1 = normalize_well_name(row["LEASE"])
+        n2 = normalize_aggressive(row["LEASE"])
+        lease_norm1[n1] = row["PROPNUM"]
+        lease_norm2[n2] = row["PROPNUM"]
+
+    def match_well_to_propnum(well_name):
+        """Try to match a well name from route export to a PROPNUM."""
+        n1 = normalize_well_name(well_name)
+        if n1 in lease_norm1:
+            return lease_norm1[n1]
+        n2 = normalize_aggressive(well_name)
+        if n2 in lease_norm2:
+            return lease_norm2[n2]
+        return None
+
+    # --- Build route -> foreman/tech/pumper mapping ---
+    print("Building pumper hierarchy...")
+    route_info = {}
+    for _, row in tech_list.iterrows():
+        route = str(row["ROUTE"]).strip()
+        route_info[route] = {
+            "foreman": str(row["FOREMAN"]).strip().title(),
+            "tech": str(row["TECH"]).strip().title(),
+            "pumper": str(row["PUMPER1"]).strip().title(),
+        }
+
+    # --- Build well -> route mapping from route export (EQV company only) ---
+    eqv_routes = route_export[route_export["Company"] == "EQV"].copy()
 
     # --- Actuals ---
     print("Processing actuals...")
@@ -68,7 +127,7 @@ def build_data():
                 row["Gross Oil, bbl"],
                 row["Gross Gas, mcf"],
                 0,
-            ]  # no water in forecast
+            ]
         well_forecasts[propnum] = data
 
     # --- Date range ---
@@ -113,24 +172,56 @@ def build_data():
         if records:
             well_data[propnum] = records
 
-    # --- Hierarchy: area -> play_area -> [[propnum, lease], ...] ---
+    # --- Build hierarchy: foreman -> tech -> pumper -> [[propnum, well_name], ...] ---
     print("Building hierarchy...")
     hierarchy = {}
-    for propnum, info in propnum_info.items():
-        if propnum not in well_data:
-            continue
-        area = info["area"]
-        play_area = info["play_area"]
-        if area not in hierarchy:
-            hierarchy[area] = {}
-        if play_area not in hierarchy[area]:
-            hierarchy[area][play_area] = []
-        hierarchy[area][play_area].append([propnum, info["lease"]])
+    pumper_wells_map = {}  # pumper_key -> list of [propnum, well_name]
 
-    # Sort wells within each group
-    for area in hierarchy:
-        for play_area in hierarchy[area]:
-            hierarchy[area][play_area].sort(key=lambda w: w[1])
+    for _, row in eqv_routes.iterrows():
+        well_name = str(row["Well Name"]).strip()
+        route = str(row["Route"]).strip()
+        propnum = match_well_to_propnum(well_name)
+
+        ri = route_info.get(route)
+        if not ri:
+            continue
+
+        foreman = ri["foreman"]
+        tech = ri["tech"]
+        pumper = ri["pumper"]
+
+        if foreman not in hierarchy:
+            hierarchy[foreman] = {}
+        if tech not in hierarchy[foreman]:
+            hierarchy[foreman][tech] = {}
+        if pumper not in hierarchy[foreman][tech]:
+            hierarchy[foreman][tech][pumper] = []
+
+        # Only add wells that have production data
+        if propnum and propnum in well_data:
+            hierarchy[foreman][tech][pumper].append([propnum, well_name])
+            # Track for pumperWells lookup
+            key = f"{foreman}|{tech}|{pumper}"
+            if key not in pumper_wells_map:
+                pumper_wells_map[key] = {}
+            pumper_wells_map[key][propnum] = well_data[propnum]
+
+    # Remove empty pumpers/techs/foremen
+    for foreman in list(hierarchy.keys()):
+        for tech in list(hierarchy[foreman].keys()):
+            for pumper in list(hierarchy[foreman][tech].keys()):
+                if not hierarchy[foreman][tech][pumper]:
+                    del hierarchy[foreman][tech][pumper]
+            if not hierarchy[foreman][tech]:
+                del hierarchy[foreman][tech]
+        if not hierarchy[foreman]:
+            del hierarchy[foreman]
+
+    # Sort wells within each pumper
+    for foreman in hierarchy:
+        for tech in hierarchy[foreman]:
+            for pumper in hierarchy[foreman][tech]:
+                hierarchy[foreman][tech][pumper].sort(key=lambda w: w[1])
 
     # --- Aggregation ---
     def aggregate_wells(propnums):
@@ -161,47 +252,69 @@ def build_data():
             return {"min": 1, "max": 100}
         return {"min": round(min(all_vals), 1), "max": round(max(all_vals), 1)}
 
-    # Company level
-    all_propnums = list(well_data.keys())
-    eqv_data = aggregate_wells(all_propnums)
+    # Company level (all wells that are in the hierarchy)
+    all_propnums_in_hier = set()
+    for foreman in hierarchy:
+        for tech in hierarchy[foreman]:
+            for pumper in hierarchy[foreman][tech]:
+                for w in hierarchy[foreman][tech][pumper]:
+                    all_propnums_in_hier.add(w[0])
+    all_propnums_in_hier = list(all_propnums_in_hier)
+    eqv_data = aggregate_wells(all_propnums_in_hier)
 
-    # Area level
-    area_groups = {}
-    for area in hierarchy:
+    # Foreman level
+    foreman_groups = {}
+    for foreman in hierarchy:
         propnums = []
-        for play_area in hierarchy[area]:
-            propnums.extend([w[0] for w in hierarchy[area][play_area]])
-        area_groups[area] = aggregate_wells(propnums)
+        for tech in hierarchy[foreman]:
+            for pumper in hierarchy[foreman][tech]:
+                propnums.extend([w[0] for w in hierarchy[foreman][tech][pumper]])
+        foreman_groups[foreman] = aggregate_wells(propnums)
 
-    # Play area level
-    play_area_groups = {}
-    for area in hierarchy:
-        for play_area in hierarchy[area]:
-            propnums = [w[0] for w in hierarchy[area][play_area]]
-            play_area_groups[play_area] = aggregate_wells(propnums)
+    # Tech level
+    tech_groups = {}
+    for foreman in hierarchy:
+        for tech in hierarchy[foreman]:
+            propnums = []
+            for pumper in hierarchy[foreman][tech]:
+                propnums.extend([w[0] for w in hierarchy[foreman][tech][pumper]])
+            tech_groups[tech] = aggregate_wells(propnums)
 
-    # Build areaWells (per play_area -> propnum -> data)
-    area_wells = {}
-    for area in hierarchy:
-        for play_area in hierarchy[area]:
-            if play_area not in area_wells:
-                area_wells[play_area] = {}
-            for propnum, _ in hierarchy[area][play_area]:
-                if propnum in well_data:
-                    area_wells[play_area][propnum] = well_data[propnum]
+    # Pumper level
+    pumper_groups = {}
+    for foreman in hierarchy:
+        for tech in hierarchy[foreman]:
+            for pumper in hierarchy[foreman][tech]:
+                propnums = [w[0] for w in hierarchy[foreman][tech][pumper]]
+                pumper_groups[pumper] = aggregate_wells(propnums)
+
+    # Build pumperWells (per pumper -> propnum -> data)
+    pumper_wells = {}
+    for foreman in hierarchy:
+        for tech in hierarchy[foreman]:
+            for pumper in hierarchy[foreman][tech]:
+                if pumper not in pumper_wells:
+                    pumper_wells[pumper] = {}
+                for propnum, _ in hierarchy[foreman][tech][pumper]:
+                    if propnum in well_data:
+                        pumper_wells[pumper][propnum] = well_data[propnum]
 
     # Final JSON
     output = {
-        "eqv": {
+        "presidio": {
             "groups": {"EQV Resources": eqv_data},
             "scales": compute_scales({"all": eqv_data}),
         },
-        "area": {"groups": area_groups, "scales": compute_scales(area_groups)},
-        "playArea": {
-            "groups": play_area_groups,
-            "scales": compute_scales(play_area_groups),
+        "foreman": {"groups": foreman_groups, "scales": compute_scales(foreman_groups)},
+        "tech": {
+            "groups": tech_groups,
+            "scales": compute_scales(tech_groups),
         },
-        "areaWells": area_wells,
+        "pumper": {
+            "groups": pumper_groups,
+            "scales": compute_scales(pumper_groups),
+        },
+        "pumperWells": pumper_wells,
         "wellScales": compute_scales(well_data),
         "hierarchy": hierarchy,
         "dateRange": [date_min, date_max],
@@ -210,12 +323,18 @@ def build_data():
     # Stats
     total_wells = sum(
         len(wells)
-        for area in hierarchy
-        for wells in hierarchy[area].values()
+        for foreman in hierarchy
+        for tech in hierarchy[foreman].values()
+        for wells in tech.values()
     )
     print(f"Total wells in dashboard: {total_wells}")
-    print(f"Areas: {list(hierarchy.keys())}")
-    print(f"Play areas: {list(play_area_groups.keys())}")
+    print(f"Foremen: {list(hierarchy.keys())}")
+    for fm in hierarchy:
+        print(f"  {fm}: Techs = {list(hierarchy[fm].keys())}")
+        for tc in hierarchy[fm]:
+            pumpers = list(hierarchy[fm][tc].keys())
+            well_count = sum(len(hierarchy[fm][tc][p]) for p in pumpers)
+            print(f"    {tc}: {len(pumpers)} pumpers, {well_count} wells")
     print(f"Date range: {date_min} to {date_max}")
 
     # Compress
@@ -252,7 +371,7 @@ body{{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);he
 .legend-dot{{width:14px;height:3px;border-radius:1px}}
 .legend-dash{{width:14px;height:0;border-top:2px dashed}}
 .main-layout{{display:flex;flex:1;overflow:hidden}}
-.sidebar{{width:260px;min-width:260px;background:var(--sidebar-bg);border-right:1px solid var(--border);overflow-y:auto;flex-shrink:0;padding:10px 0}}
+.sidebar{{width:280px;min-width:280px;background:var(--sidebar-bg);border-right:1px solid var(--border);overflow-y:auto;flex-shrink:0;padding:10px 0}}
 .sidebar::-webkit-scrollbar{{width:5px}}.sidebar::-webkit-scrollbar-track{{background:transparent}}.sidebar::-webkit-scrollbar-thumb{{background:var(--border);border-radius:3px}}
 .nav-section-label{{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--text-dim);padding:10px 14px 5px}}
 .nb{{display:flex;align-items:center;gap:7px;cursor:pointer;border:none;background:none;width:100%;text-align:left;transition:all .12s;position:relative;font-family:'DM Sans',sans-serif;color:var(--text-mid)}}
@@ -262,6 +381,7 @@ body{{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);he
 .d0{{padding:7px 14px;font-size:12.5px;font-weight:500}}
 .d1{{padding:5px 14px 5px 30px;font-size:11.5px}}
 .d2{{padding:4px 14px 4px 46px;font-size:11px;color:var(--text-dim)}}
+.d3{{padding:3px 14px 3px 62px;font-size:10.5px;color:var(--text-dim)}}
 .chv{{margin-left:auto;font-size:9px;color:var(--text-dim);transition:transform .2s;flex-shrink:0}}
 .nb.expanded>.chv{{transform:rotate(90deg)}}
 .coll{{overflow:hidden;max-height:0;transition:max-height .25s ease}}.coll.open{{max-height:99999px}}
@@ -325,7 +445,7 @@ function init(){{
 const DPR=window.devicePixelRatio||1,$=id=>document.getElementById(id);
 const sidebar=$('sidebar'),ca=$('ca'),tooltip=$('tooltip'),ttDate=$('ttDate'),ttC=$('ttC');
 const hier=D.hierarchy;
-let sel={{level:'eqv',group:'EQV Resources'}};
+let sel={{level:'presidio',group:'EQV Resources'}};
 let dMin=D.dateRange[0],dMax=D.dateRange[1];
 let showA=true,showF=true,isDaily=false;
 const C={{o:'#16a34a',g:'#dc2626',w:'#2563eb'}};
@@ -338,25 +458,32 @@ function clearAc(){{sidebar.querySelectorAll('.active').forEach(e=>e.classList.r
 function buildSidebar(){{
   let h='<div class="nav-section-label">Company</div>';
   h+='<button class="nb d0 active" id="np"><div class="ndot" style="background:var(--accent)"></div>EQV Resources (All)</button>';
-  h+='<div class="nav-section-label">Areas</div>';
-  Object.keys(hier).sort().forEach(area=>{{
-    const aid=esc(area),playAreas=Object.keys(hier[area]).sort();
-    h+='<button class="nb d0" id="na-'+aid+'"><div class="ndot" style="background:#8a857d"></div>'+area;
-    if(playAreas.length)h+='<span class="chv">&#9654;</span>';
+  h+='<div class="nav-section-label">Foremen</div>';
+  Object.keys(hier).sort().forEach(fm=>{{
+    const fid=esc(fm),techs=Object.keys(hier[fm]).sort();
+    h+='<button class="nb d0" id="nf-'+fid+'"><div class="ndot" style="background:#8a857d"></div>'+fm;
+    if(techs.length)h+='<span class="chv">&#9654;</span>';
     h+='</button>';
-    if(playAreas.length){{
-      h+='<div class="coll" id="ca-'+aid+'">';
-      playAreas.forEach(pa=>{{
-        const pid=esc(area+'_'+pa),wells=hier[area][pa]||[];
-        h+='<button class="nb d1" id="np-'+pid+'"><div class="ndot" style="background:#b8b3aa"></div>'+pa;
-        if(wells.length)h+='<span class="chv">&#9654;</span>';
+    if(techs.length){{
+      h+='<div class="coll" id="cf-'+fid+'">';
+      techs.forEach(tc=>{{
+        const tid=esc(fm+'_'+tc),pumpers=Object.keys(hier[fm][tc]).sort();
+        h+='<button class="nb d1" id="nt-'+tid+'"><div class="ndot" style="background:#b8b3aa"></div>'+tc;
+        if(pumpers.length)h+='<span class="chv">&#9654;</span>';
         h+='</button>';
-        if(wells.length){{
-          h+='<div class="coll" id="cp-'+pid+'">';
-          wells.forEach(w=>{{h+='<button class="nb d2" id="nw-'+esc(w[0])+'">'+w[1]+'</button>'}});
-          h+='</div>';}}
-      }});
-      h+='</div>';}}
+        if(pumpers.length){{
+          h+='<div class="coll" id="ct-'+tid+'">';
+          pumpers.forEach(pm=>{{
+            const pid=esc(fm+'_'+tc+'_'+pm),wells=hier[fm][tc][pm]||[];
+            h+='<button class="nb d2" id="nm-'+pid+'">'+pm;
+            if(wells.length)h+='<span class="chv">&#9654;</span>';
+            h+='</button>';
+            if(wells.length){{
+              h+='<div class="coll" id="cm-'+pid+'">';
+              wells.forEach(w=>{{h+='<button class="nb d3" id="nw-'+esc(w[0])+'">'+w[1]+'</button>'}});
+              h+='</div>';}}
+          }});h+='</div>';}}
+      }});h+='</div>';}}
   }});
   sidebar.innerHTML=h;attachNav();
 }}
@@ -364,15 +491,19 @@ function buildSidebar(){{
 function tog(btn,cont){{if(!cont)return;const p=cont.parentElement;if(p)p.querySelectorAll(':scope > .coll.open').forEach(c=>{{if(c!==cont){{c.classList.remove('open');if(c.previousElementSibling)c.previousElementSibling.classList.remove('expanded')}}}});const o=cont.classList.contains('open');if(!o){{cont.classList.add('open');btn.classList.add('expanded')}}else{{cont.classList.remove('open');btn.classList.remove('expanded')}}}}
 
 function attachNav(){{
-  $('np').onclick=()=>{{clearAc();$('np').classList.add('active');sel={{level:'eqv',group:'EQV Resources'}};render()}};
-  Object.keys(hier).sort().forEach(area=>{{
-    const aid=esc(area),ab=$('na-'+aid),ac=$('ca-'+aid);
-    ab.onclick=()=>{{clearAc();ab.classList.add('active');sel={{level:'area',group:area,area:area}};render();tog(ab,ac)}};
-    Object.keys(hier[area]).sort().forEach(pa=>{{
-      const pid=esc(area+'_'+pa),pb=$('np-'+pid),pc=$('cp-'+pid);
-      pb.onclick=e=>{{e.stopPropagation();clearAc();pb.classList.add('active');ab.classList.add('expanded');if(ac)ac.classList.add('open');sel={{level:'playArea',group:pa,area:area,playArea:pa}};render();tog(pb,pc)}};
-      (hier[area][pa]||[]).forEach(w=>{{const wb=$('nw-'+esc(w[0]));if(!wb)return;
-        wb.onclick=e=>{{e.stopPropagation();clearAc();wb.classList.add('active');ab.classList.add('expanded');if(ac)ac.classList.add('open');pb.classList.add('expanded');if(pc)pc.classList.add('open');sel={{level:'well',group:w[0],area:area,playArea:pa,well:w[0],wellName:w[1]}};render()}};
+  $('np').onclick=()=>{{clearAc();$('np').classList.add('active');sel={{level:'presidio',group:'EQV Resources'}};render()}};
+  Object.keys(hier).sort().forEach(fm=>{{
+    const fid=esc(fm),fb=$('nf-'+fid),fc=$('cf-'+fid);
+    fb.onclick=()=>{{clearAc();fb.classList.add('active');sel={{level:'foreman',group:fm,foreman:fm}};render();tog(fb,fc)}};
+    Object.keys(hier[fm]).sort().forEach(tc=>{{
+      const tid=esc(fm+'_'+tc),tb=$('nt-'+tid),tc2=$('ct-'+tid);
+      tb.onclick=e=>{{e.stopPropagation();clearAc();tb.classList.add('active');fb.classList.add('expanded');if(fc)fc.classList.add('open');sel={{level:'tech',group:tc,foreman:fm,tech:tc}};render();tog(tb,tc2)}};
+      Object.keys(hier[fm][tc]).sort().forEach(pm=>{{
+        const pid=esc(fm+'_'+tc+'_'+pm),pb=$('nm-'+pid),pc=$('cm-'+pid);
+        pb.onclick=e=>{{e.stopPropagation();clearAc();pb.classList.add('active');fb.classList.add('expanded');if(fc)fc.classList.add('open');tb.classList.add('expanded');if(tc2)tc2.classList.add('open');sel={{level:'pumper',group:pm,foreman:fm,tech:tc,pumper:pm}};render();tog(pb,pc)}};
+        (hier[fm][tc][pm]||[]).forEach(w=>{{const wb=$('nw-'+esc(w[0]));if(!wb)return;
+          wb.onclick=e=>{{e.stopPropagation();clearAc();wb.classList.add('active');fb.classList.add('expanded');if(fc)fc.classList.add('open');tb.classList.add('expanded');if(tc2)tc2.classList.add('open');pb.classList.add('expanded');if(pc)pc.classList.add('open');sel={{level:'well',group:w[0],foreman:fm,tech:tc,pumper:pm,well:w[0],wellName:w[1]}};render()}};
+        }});
       }});
     }});
   }});
@@ -513,12 +644,12 @@ function yearlyTable(data){{
 function render(){{
   let data,scales,title;
   if(sel.level==='well'){{
-    const aw=D.areaWells[sel.playArea]||{{}};data=aw[sel.well]||[];scales=D.wellScales;title=sel.wellName||sel.well;
+    const pw=D.pumperWells[sel.pumper]||{{}};data=pw[sel.well]||[];scales=D.wellScales;title=sel.wellName||sel.well;
   }}else{{
     const ld=D[sel.level];data=ld.groups[sel.group]||[];scales=ld.scales;title=sel.group;
   }}
-  let bc=sel.level==='eqv'?'Company':sel.level==='area'?'Area':sel.level==='playArea'?'Play Area':'Well';
-  if(sel.area)bc=sel.area;if(sel.playArea)bc+=' \\u2192 '+sel.playArea;if(sel.wellName)bc+=' \\u2192 '+sel.wellName;
+  let bc=sel.level.charAt(0).toUpperCase()+sel.level.slice(1);
+  if(sel.foreman)bc=sel.foreman;if(sel.tech)bc+=' \\u2192 '+sel.tech;if(sel.pumper)bc+=' \\u2192 '+sel.pumper;if(sel.wellName)bc+=' \\u2192 '+sel.wellName;
 
   let h='<div class="content-header"><div><div class="content-title">'+title+'</div><div class="breadcrumb">'+bc+'</div></div>';
   h+='<div class="controls-row">';
