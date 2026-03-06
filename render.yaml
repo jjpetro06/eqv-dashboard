@@ -2,7 +2,7 @@ services:
   - type: web
     name: eqv-dashboard
     runtime: python
-    buildCommand: pip install openpyxl pandas && python build_dashboard.py
+    buildCommand: pip install openpyxl pandas && python build_dashboard.py && cp eqv_production_dashboard.html index.html
     startCommand: python -m http.server 10000
     envVars:
       - key: PYTHON_VERSION
